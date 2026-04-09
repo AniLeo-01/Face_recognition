@@ -1,0 +1,119 @@
+"""Central configuration for the Face Recognition System."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+
+@dataclass
+class DetectionConfig:
+    """Face detection configuration."""
+
+    model_name: Literal["mtcnn"] = "mtcnn"
+    min_face_size: int = 40
+    confidence_threshold: float = 0.90
+    device: str = "cpu"
+    # MTCNN thresholds for three stages (P-Net, R-Net, O-Net)
+    thresholds: list[float] = field(default_factory=lambda: [0.6, 0.7, 0.7])
+    select_largest: bool = False
+    keep_all: bool = True
+
+
+@dataclass
+class AlignmentConfig:
+    """Face alignment and quality configuration."""
+
+    output_size: tuple[int, int] = (160, 160)
+    # Quality gate thresholds
+    min_face_size: int = 30
+    min_blur_score: float = 50.0  # Laplacian variance threshold
+    max_yaw_angle: float = 60.0  # degrees
+    max_pitch_angle: float = 45.0  # degrees
+
+
+@dataclass
+class RecognitionConfig:
+    """Face recognition / embedding configuration."""
+
+    model_name: Literal["inception_resnet_v1"] = "inception_resnet_v1"
+    pretrained: Literal["vggface2", "casia-webface"] = "vggface2"
+    embedding_dim: int = 512
+    device: str = "cpu"
+    # Matching
+    similarity_threshold: float = 0.65
+    top_k: int = 5
+    # FAISS index type
+    faiss_index_type: Literal["flat", "ivf"] = "flat"
+    faiss_nprobe: int = 10
+
+
+@dataclass
+class APIConfig:
+    """API server configuration."""
+
+    host: str = "0.0.0.0"
+    port: int = 8000
+    workers: int = 1
+    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    max_upload_size_mb: int = 50
+    rate_limit_per_minute: int = 120
+
+
+@dataclass
+class DatabaseConfig:
+    """Database configuration."""
+
+    url: str = "sqlite+aiosqlite:///./face_recognition.db"
+    echo: bool = False
+
+
+@dataclass
+class SystemConfig:
+    """Top-level system configuration."""
+
+    detection: DetectionConfig = field(default_factory=DetectionConfig)
+    alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
+    recognition: RecognitionConfig = field(default_factory=RecognitionConfig)
+    api: APIConfig = field(default_factory=APIConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    # Paths
+    data_dir: Path = Path("./data")
+    gallery_dir: Path = Path("./data/gallery")
+    logs_dir: Path = Path("./logs")
+    models_dir: Path = Path("./models")
+
+    def __post_init__(self) -> None:
+        for d in [self.data_dir, self.gallery_dir, self.logs_dir, self.models_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def from_env(cls) -> SystemConfig:
+        """Create config from environment variables with sensible defaults."""
+        device = "cuda" if os.getenv("USE_GPU", "").lower() == "true" else "cpu"
+        db_url = os.getenv(
+            "DATABASE_URL", "sqlite+aiosqlite:///./face_recognition.db"
+        )
+        return cls(
+            detection=DetectionConfig(device=device),
+            recognition=RecognitionConfig(device=device),
+            database=DatabaseConfig(url=db_url),
+        )
+
+
+# Singleton config
+_config: SystemConfig | None = None
+
+
+def get_config() -> SystemConfig:
+    global _config
+    if _config is None:
+        _config = SystemConfig.from_env()
+    return _config
+
+
+def set_config(config: SystemConfig) -> None:
+    global _config
+    _config = config
