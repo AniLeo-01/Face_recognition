@@ -1,0 +1,54 @@
+# =============================================================================
+# Face Detection & Recognition System — GPU-enabled Docker Image
+# Requires NVIDIA Container Toolkit
+# =============================================================================
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04 AS runtime
+
+LABEL maintainer="Face Recognition Team"
+LABEL description="Face Detection & Recognition System API (GPU)"
+LABEL version="1.0.0"
+
+# Install Python and runtime deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3-pip \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create non-root user
+RUN groupadd -r facerec && useradd -r -g facerec -m facerec
+
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY pyproject.toml .
+
+RUN mkdir -p /app/data/gallery /app/logs /app/models \
+    && chown -R facerec:facerec /app
+
+USER facerec
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    USE_GPU=true \
+    DATABASE_URL=sqlite+aiosqlite:///./data/face_recognition.db \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+CMD ["python3", "-m", "uvicorn", "src.api.app:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--log-level", "info"]
