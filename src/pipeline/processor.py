@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 from src.alignment.aligner import FaceAligner
-from src.alignment.quality import QualityAssessor, QualityReport
+from src.alignment.quality import QualityAssessor, QualityReport, QualityTier
 from src.config import SystemConfig, get_config
 from src.detection.detector import FaceDetector
 from src.detection.models import DetectedFace, DetectionResult
@@ -142,12 +142,22 @@ class FaceRecognitionPipeline:
         result.alignment_time_ms = (time.perf_counter() - align_start) * 1000
 
         # --- Quality Gate ---
-        quality_passed: list[tuple[DetectedFace, np.ndarray, QualityReport]] = []
+        # Three tiers (see QualityTier enum):
+        #   PASS     → embed + match with standard similarity threshold
+        #   MARGINAL → embed + match with tightened threshold (avoids false positives
+        #              while still giving degraded faces a chance to be identified)
+        #   FAIL     → skip embedding entirely (face too degraded to be useful)
+        to_embed: list[tuple[DetectedFace, np.ndarray, QualityReport]] = []
         for face, crop in aligned_faces:
             qr = self.quality_assessor.assess(crop, face)
-            if skip_quality or qr.passed:
-                quality_passed.append((face, crop, qr))
-            else:
+            if skip_quality:
+                to_embed.append((face, crop, qr))
+            elif qr.tier == QualityTier.FAIL:
+                # Hard reject — still include in result for API transparency
+                logger.debug(
+                    "Face FAILED quality gate (score=%.1f): %s",
+                    qr.quality_score, qr.reasons,
+                )
                 result.recognized_faces.append(
                     RecognizedFace(
                         detected_face=face,
@@ -155,22 +165,27 @@ class FaceRecognitionPipeline:
                         quality=qr,
                     )
                 )
+            else:
+                # PASS or MARGINAL — proceed to embedding
+                to_embed.append((face, crop, qr))
 
-        if not quality_passed:
+        if not to_embed:
             result.total_time_ms = (time.perf_counter() - total_start) * 1000
             return result
 
         # --- Embedding ---
         emb_start = time.perf_counter()
-        crops = [crop for _, crop, _ in quality_passed]
+        crops = [crop for _, crop, _ in to_embed]
         embeddings = self.embedder.embed_batch(crops)
         result.embedding_time_ms = (time.perf_counter() - emb_start) * 1000
 
         # --- Matching ---
         match_start = time.perf_counter()
-        for i, (face, crop, qr) in enumerate(quality_passed):
+        for i, (face, crop, qr) in enumerate(to_embed):
             emb = embeddings[i]
-            match = self.gallery.identify(emb)
+            # Pass quality score so the matcher can tighten its threshold for
+            # MARGINAL faces (reduces false positives on low-quality frames)
+            match = self.gallery.identify(emb, quality_score=qr.quality_score)
 
             recognized = RecognizedFace(
                 detected_face=face,
@@ -204,33 +219,66 @@ class FaceRecognitionPipeline:
     ) -> dict:
         """Enroll a new identity with one or more face images.
 
+        Enrollment uses a **relaxed** quality gate:
+        * PASS and MARGINAL faces are both enrolled (the person may only have
+          one photo available, taken at a slight angle or under uneven light).
+        * Quality score and tier are recorded in the summary for transparency.
+        * Among all detected faces in an image the one with the highest quality
+          score is preferred over the one with the highest detection confidence.
+
         Args:
-            identity_id: Unique ID for the person.
+            identity_id:   Unique ID for the person.
             identity_name: Human-readable name.
-            images: List of RGB numpy arrays containing the person's face.
+            images:        List of RGB numpy arrays containing the person's face.
 
         Returns:
             Enrollment summary dict.
         """
         total_embeddings = 0
         failed_images = 0
+        quality_scores: list[float] = []
 
         for img in images:
             detection = self.detector.detect(Image.fromarray(img))
             if detection.num_faces == 0:
+                logger.warning("Enrollment: no face detected in image")
                 failed_images += 1
                 continue
 
-            # Use the highest-confidence face
-            best_face = detection.faces[0]
-            aligned = self.aligner.align(img, best_face)
-            if aligned is None:
+            # Pick the face with the best quality score (not just highest detection conf)
+            best_face, best_crop, best_qr = None, None, None
+            for face in detection.faces:
+                aligned = self.aligner.align(img, face)
+                if aligned is None:
+                    continue
+                qr = self.quality_assessor.assess(aligned, face)
+                if best_qr is None or qr.quality_score > best_qr.quality_score:
+                    best_face, best_crop, best_qr = face, aligned, qr
+
+            if best_crop is None or best_qr is None:
+                logger.warning("Enrollment: alignment failed for all faces in image")
                 failed_images += 1
                 continue
 
-            embedding = self.embedder.embed(aligned)
+            # During enrollment accept PASS and MARGINAL; skip only hard FAILs
+            if best_qr.tier == QualityTier.FAIL:
+                logger.warning(
+                    "Enrollment: image skipped — quality too low (score=%.1f, reasons=%s)",
+                    best_qr.quality_score, best_qr.reasons,
+                )
+                failed_images += 1
+                continue
+
+            embedding = self.embedder.embed(best_crop)
             self.gallery.add(identity_id, identity_name, embedding)
             total_embeddings += 1
+            quality_scores.append(best_qr.quality_score)
+            logger.info(
+                "Enrolled %s: quality_score=%.1f tier=%s",
+                identity_name, best_qr.quality_score, best_qr.tier.value,
+            )
+
+        avg_quality = float(np.mean(quality_scores)) if quality_scores else 0.0
 
         return {
             "identity_id": identity_id,
@@ -238,6 +286,7 @@ class FaceRecognitionPipeline:
             "images_processed": len(images),
             "embeddings_created": total_embeddings,
             "failed_images": failed_images,
+            "avg_enrollment_quality": round(avg_quality, 1),
             "gallery_size": self.gallery.size,
         }
 

@@ -24,14 +24,47 @@ class DetectionConfig:
 
 @dataclass
 class AlignmentConfig:
-    """Face alignment and quality configuration."""
+    """Face alignment and quality configuration.
+
+    Quality is now scored on a continuous 0–100 scale (composite of blur,
+    pose, face-size, and symmetry) rather than a set of hard per-metric limits.
+    Faces are placed in one of three tiers:
+
+        PASS     quality_score >= hard_quality_threshold  (default 55)
+                 → embed + match with the standard similarity threshold
+        MARGINAL quality_score >= soft_quality_threshold  (default 30)
+                 → embed + match with a tightened similarity threshold
+        FAIL     quality_score <  soft_quality_threshold
+                 → skip embedding entirely
+
+    Individual per-metric caps still exist to catch truly unusable angles/sizes,
+    but they feed into the score rather than causing immediate rejection.
+
+    All thresholds can be overridden via environment variables:
+        QUALITY_HARD_THRESHOLD  (default 55)
+        QUALITY_SOFT_THRESHOLD  (default 30)
+        QUALITY_MAX_YAW         (default 60.0 degrees)
+        QUALITY_MAX_PITCH       (default 45.0 degrees)
+    """
 
     output_size: tuple[int, int] = (160, 160)
-    # Quality gate thresholds
     min_face_size: int = 30
-    min_blur_score: float = 50.0  # Laplacian variance threshold
-    max_yaw_angle: float = 60.0  # degrees
-    max_pitch_angle: float = 45.0  # degrees
+
+    # ── Composite quality thresholds ──────────────────────────────────────────
+    hard_quality_threshold: float = field(
+        default_factory=lambda: float(os.getenv("QUALITY_HARD_THRESHOLD", "55"))
+    )
+    soft_quality_threshold: float = field(
+        default_factory=lambda: float(os.getenv("QUALITY_SOFT_THRESHOLD", "30"))
+    )
+
+    # ── Per-metric caps (feed into pose_score; do NOT cause direct rejection) ─
+    max_yaw_angle: float = field(
+        default_factory=lambda: float(os.getenv("QUALITY_MAX_YAW", "60.0"))
+    )
+    max_pitch_angle: float = field(
+        default_factory=lambda: float(os.getenv("QUALITY_MAX_PITCH", "45.0"))
+    )
 
 
 @dataclass
@@ -43,7 +76,8 @@ class RecognitionConfig:
     embedding_dim: int = 512
     device: str = "cpu"
     # Matching
-    similarity_threshold: float = 0.65
+    similarity_threshold: float = 0.65          # threshold for PASS-tier faces
+    marginal_similarity_boost: float = 0.08     # added to threshold for MARGINAL-tier faces
     top_k: int = 5
     # FAISS index type
     faiss_index_type: Literal["flat", "ivf"] = "flat"

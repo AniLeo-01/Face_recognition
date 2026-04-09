@@ -150,16 +150,55 @@ class GalleryMatcher:
     def identify(
         self,
         query_embedding: np.ndarray,
+        quality_score: float = 100.0,
     ) -> MatchResult | None:
-        """Identify the best match above the similarity threshold.
+        """Identify the best match above a quality-aware similarity threshold.
 
-        Returns the top match if its similarity exceeds the configured threshold,
-        otherwise returns None (unknown identity).
+        For faces with degraded quality (MARGINAL tier) we raise the required
+        similarity by ``marginal_similarity_boost`` to reduce false positives:
+        a noisy embedding should only be confirmed when it is unmistakably close
+        to a gallery entry.
+
+        For very high-quality faces (score > 85) we slightly relax the threshold
+        (by up to 0.03) to improve recall on clean but slightly off-angle shots.
+
+        Args:
+            query_embedding: L2-normalised 512-d query vector.
+            quality_score:   Composite quality score (0–100) from QualityAssessor.
+
+        Returns:
+            Best MatchResult if similarity ≥ effective threshold, else None.
         """
         matches = self.search(query_embedding, top_k=1)
         if not matches:
             return None
-        if matches[0].similarity >= self.config.similarity_threshold:
+
+        base_thr = self.config.similarity_threshold
+
+        # Quality-adaptive adjustment:
+        #   score >= 85  → relax by up to -0.03  (high-confidence embedding)
+        #   55 <= score < 85 → no change
+        #   score < 55   → tighten by +marginal_similarity_boost
+        if quality_score >= 85.0:
+            # High-quality face: relax threshold slightly to improve recall on
+            # clean but slightly off-angle shots (max -0.03 at score=100)
+            ease = (quality_score - 85.0) / 15.0 * 0.03
+            effective_thr = base_thr - ease
+        elif quality_score < 55.0:
+            # MARGINAL-tier face: tighten threshold to suppress false positives
+            # from noisy embeddings (aligns with AlignmentConfig.hard_quality_threshold)
+            effective_thr = base_thr + self.config.marginal_similarity_boost
+        else:
+            effective_thr = base_thr
+
+        effective_thr = float(np.clip(effective_thr, 0.0, 1.0))
+
+        logger.debug(
+            "identify: quality_score=%.1f  base_thr=%.3f  effective_thr=%.3f  best_sim=%.3f",
+            quality_score, base_thr, effective_thr, matches[0].similarity,
+        )
+
+        if matches[0].similarity >= effective_thr:
             return matches[0]
         return None
 
