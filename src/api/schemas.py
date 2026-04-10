@@ -34,6 +34,7 @@ class RecognizedFaceSchema(BaseModel):
     identity_id: str | None
     similarity: float
     quality: dict[str, Any] | None = None
+    top_candidate: dict[str, Any] | None = None  # closest gallery hit even below threshold
 
 
 class RecognitionResponse(BaseModel):
@@ -56,7 +57,10 @@ class EnrollResponse(BaseModel):
     identity_name: str
     images_processed: int
     embeddings_created: int
+    embeddings_per_image: float = 0.0
+    augmentation_enabled: bool = False
     failed_images: int
+    avg_enrollment_quality: float = 0.0
     gallery_size: int
 
 

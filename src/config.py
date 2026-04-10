@@ -76,9 +76,18 @@ class RecognitionConfig:
     embedding_dim: int = 512
     device: str = "cpu"
     # Matching
-    similarity_threshold: float = 0.65          # threshold for PASS-tier faces
-    marginal_similarity_boost: float = 0.08     # added to threshold for MARGINAL-tier faces
+    similarity_threshold: float = 0.55          # threshold for PASS-tier faces (cross-domain: portrait→scene)
+    marginal_similarity_boost: float = 0.04     # added to threshold for MARGINAL-tier faces
     top_k: int = 5
+    # Enrollment augmentation — generates N synthetic variants per photo to
+    # broaden gallery coverage (handles lighting, angle, and flip variation).
+    # Set to 0 to disable; 5 is a good default (flip + 2 brightness + 2 rotation)
+    enrollment_augmentation: bool = True
+    enrollment_aug_brightness_steps: int = 2   # ±20%, ±40% → 4 extra embeddings
+    enrollment_aug_rotation_deg: float = 10.0  # rotate ±N° → 2 extra embeddings
+    # After matching, suppress duplicate detections of the same identity:
+    # keep only the highest-similarity hit per identity_id per frame.
+    deduplicate_identities: bool = True
     # FAISS index type
     faiss_index_type: Literal["flat", "ivf"] = "flat"
     faiss_nprobe: int = 10

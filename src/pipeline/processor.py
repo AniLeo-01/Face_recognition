@@ -33,8 +33,17 @@ class RecognizedFace:
     identity_name: str = "Unknown"
     identity_id: str | None = None
     similarity: float = 0.0
+    # Best gallery candidate even when below threshold — for diagnostics
+    top_candidate: MatchResult | None = None
 
     def to_dict(self) -> dict:
+        top = None
+        if self.top_candidate and self.identity_id is None:
+            # Only expose when NOT already matched (avoids redundancy)
+            top = {
+                "name": self.top_candidate.identity_name,
+                "similarity": round(self.top_candidate.similarity, 4),
+            }
         return {
             "bbox": list(self.detected_face.bbox),
             "confidence": round(self.detected_face.confidence, 4),
@@ -42,6 +51,7 @@ class RecognizedFace:
             "identity_id": self.identity_id,
             "similarity": round(self.similarity, 4),
             "quality": self.quality.to_dict() if self.quality else None,
+            "top_candidate": top,
         }
 
 
@@ -187,12 +197,17 @@ class FaceRecognitionPipeline:
             # MARGINAL faces (reduces false positives on low-quality frames)
             match = self.gallery.identify(emb, quality_score=qr.quality_score)
 
+            # Always fetch top-1 candidate for diagnostics (even when below threshold)
+            top_candidates = self.gallery.search(emb, top_k=1)
+            top_candidate = top_candidates[0] if top_candidates else None
+
             recognized = RecognizedFace(
                 detected_face=face,
                 aligned_crop=crop,
                 quality=qr,
                 embedding=emb,
                 match=match,
+                top_candidate=top_candidate,
             )
             if match is not None:
                 recognized.identity_name = match.identity_name
@@ -202,6 +217,49 @@ class FaceRecognitionPipeline:
             result.recognized_faces.append(recognized)
         result.matching_time_ms = (time.perf_counter() - match_start) * 1000
 
+        # --- Per-identity deduplication ---
+        # A person can only be at one location in a frame. When the same
+        # identity fires on multiple face regions, keep only the single
+        # highest-similarity detection and demote the rest to Unknown.
+        if self.config.recognition.deduplicate_identities:
+            seen: dict[str, float] = {}   # identity_id → best similarity so far
+            # First pass: find the best similarity per identity
+            for face in result.recognized_faces:
+                if face.identity_id is None:
+                    continue
+                if face.identity_id not in seen or face.similarity > seen[face.identity_id]:
+                    seen[face.identity_id] = face.similarity
+            # Second pass: demote duplicates (not the best hit)
+            best_used: set[str] = set()
+            for face in result.recognized_faces:
+                if face.identity_id is None:
+                    continue
+                iid = face.identity_id
+                if iid in best_used or face.similarity < seen[iid]:
+                    # This is a duplicate — demote to Unknown
+                    logger.debug(
+                        "Dedup: demoted %s (sim=%.3f) — better hit already kept (sim=%.3f)",
+                        face.identity_name, face.similarity, seen[iid],
+                    )
+                    face.top_candidate = type("_TopCandidate", (), {
+                        "identity_name": face.identity_name,
+                        "similarity": face.similarity,
+                    })()
+                    # Reuse top_candidate field via MatchResult-like object
+                    from src.recognition.matcher import MatchResult
+                    face.top_candidate = MatchResult(
+                        identity_id=iid,
+                        identity_name=face.identity_name,
+                        distance=1.0 - face.similarity,
+                        similarity=face.similarity,
+                    )
+                    face.identity_id = None
+                    face.identity_name = "Unknown"
+                    face.similarity = 0.0
+                    face.match = None
+                else:
+                    best_used.add(iid)
+
         result.total_time_ms = (time.perf_counter() - total_start) * 1000
         logger.info(
             "Pipeline: %d detected, %d recognized in %.1fms",
@@ -210,6 +268,64 @@ class FaceRecognitionPipeline:
             result.total_time_ms,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Enrollment augmentation
+    # ------------------------------------------------------------------
+
+    def _augment_crop(self, crop: np.ndarray) -> list[np.ndarray]:
+        """Generate augmented variants of a face crop for richer gallery coverage.
+
+        Augmentations (all applied to the 160×160 aligned crop, RGB uint8):
+          • Horizontal flip            — mirrors left/right appearance
+          • Brightness ±20%, ±40%     — handles lighting variation
+          • In-plane rotation ±N°     — handles slight head-tilt variation
+
+        Only augmentations that pass the quality assessor at PASS/MARGINAL tier
+        are included, so badly-warped variants are automatically dropped.
+
+        Returns
+        -------
+        List of crops including the *original* as the first entry.
+        """
+        cfg = self.config.recognition
+        variants: list[np.ndarray] = [crop]  # original always first
+
+        h, w = crop.shape[:2]
+        center = (w // 2, h // 2)
+
+        # ── Horizontal flip ──────────────────────────────────────────────────
+        flipped = crop[:, ::-1, :].copy()
+        qr = self.quality_assessor.assess(flipped)
+        if qr.passed:
+            variants.append(flipped)
+
+        # ── Brightness shifts ────────────────────────────────────────────────
+        steps = cfg.enrollment_aug_brightness_steps
+        for step in range(1, steps + 1):
+            for delta in (+step * 20, -step * 20):
+                bright = np.clip(crop.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+                qr = self.quality_assessor.assess(bright)
+                if qr.passed:
+                    variants.append(bright)
+
+        # ── In-plane rotations ───────────────────────────────────────────────
+        rot_deg = cfg.enrollment_aug_rotation_deg
+        for angle in (+rot_deg, -rot_deg):
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated = cv2.warpAffine(
+                crop, M, (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+            qr = self.quality_assessor.assess(rotated)
+            if qr.passed:
+                variants.append(rotated)
+
+        logger.debug(
+            "Augmentation: %d variants generated from 1 crop", len(variants)
+        )
+        return variants
 
     def enroll(
         self,
@@ -269,22 +385,39 @@ class FaceRecognitionPipeline:
                 failed_images += 1
                 continue
 
-            embedding = self.embedder.embed(best_crop)
-            self.gallery.add(identity_id, identity_name, embedding)
-            total_embeddings += 1
+            # Optionally generate augmented crops to broaden gallery coverage.
+            # This is especially important when only one enrollment photo is
+            # available — flip + brightness + rotation variants fill in the
+            # appearance space so scene faces at different angles still match.
+            if self.config.recognition.enrollment_augmentation:
+                crops_to_embed = self._augment_crop(best_crop)
+            else:
+                crops_to_embed = [best_crop]
+
+            embeddings_batch = self.embedder.embed_batch(crops_to_embed)
+            for emb in embeddings_batch:
+                self.gallery.add(identity_id, identity_name, emb)
+
+            n_added = len(embeddings_batch)
+            total_embeddings += n_added
             quality_scores.append(best_qr.quality_score)
             logger.info(
-                "Enrolled %s: quality_score=%.1f tier=%s",
+                "Enrolled %s: quality_score=%.1f tier=%s  (+%d augmented embeddings, gallery_size=%d)",
                 identity_name, best_qr.quality_score, best_qr.tier.value,
+                n_added, self.gallery.size,
             )
 
         avg_quality = float(np.mean(quality_scores)) if quality_scores else 0.0
+        source_images = len(images) - failed_images
+        aug_flag = self.config.recognition.enrollment_augmentation
 
         return {
             "identity_id": identity_id,
             "identity_name": identity_name,
             "images_processed": len(images),
             "embeddings_created": total_embeddings,
+            "embeddings_per_image": round(total_embeddings / source_images, 1) if source_images > 0 else 0,
+            "augmentation_enabled": aug_flag,
             "failed_images": failed_images,
             "avg_enrollment_quality": round(avg_quality, 1),
             "gallery_size": self.gallery.size,
